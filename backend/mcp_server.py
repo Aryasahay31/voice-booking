@@ -27,6 +27,8 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 API_URL = os.getenv("BOOKING_API_URL", "http://127.0.0.1:8000")
+_api_key = os.getenv("BACKEND_API_KEY", "").strip()
+API_HEADERS = {"X-API-Key": _api_key} if _api_key else {}
 MCP_PORT = int(os.getenv("MCP_PORT", "8001"))
 
 mcp = FastMCP(
@@ -51,7 +53,7 @@ CALLER_TOOLS = [
 
 async def _api(method: str, path: str, **kw) -> tuple[bool, object]:
     try:
-        async with httpx.AsyncClient(base_url=API_URL, timeout=5) as client:
+        async with httpx.AsyncClient(base_url=API_URL, timeout=5, headers=API_HEADERS) as client:
             r = await client.request(method, path, **kw)
     except httpx.HTTPError:
         return False, "The booking system is unreachable right now. Offer a callback instead."

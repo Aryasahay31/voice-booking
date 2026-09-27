@@ -49,6 +49,9 @@ from prompts import (  # noqa: E402
 logger = logging.getLogger("booking-agent")
 
 API_URL = os.getenv("BOOKING_API_URL", "http://127.0.0.1:8000")
+# Must match the backend's BACKEND_API_KEY once it's deployed (empty = local, no key).
+_api_key = os.getenv("BACKEND_API_KEY", "").strip()
+API_HEADERS = {"X-API-Key": _api_key} if _api_key else {}
 
 # ---- conversation handling (Step 2) ----
 # If the backend is down, callback requests are saved here so nobody gets lost.
@@ -244,6 +247,13 @@ class BookingAssistant(VoiceAssistant):
             detail = r.json().get("detail", r.text)
         except ValueError:
             detail = r.text
+        # Make backend refusals visible (e.g. 401 = API key mismatch). 4xx like 409 "slot
+        # taken" are normal conversation, so only auth/server problems are warnings.
+        level = logging.WARNING if r.status_code in (401, 403) or r.status_code >= 500 else logging.INFO
+        logger.log(level, "booking API %s %s -> %d: %s", method, path, r.status_code, detail)
+        if r.status_code in (401, 403):
+            logger.warning("check that BACKEND_API_KEY is identical in agent/.env and backend/.env, "
+                           "and restart the backend after editing its .env")
         return False, str(detail)
 
     async def _find_service(self, name: str) -> dict | None:
@@ -499,7 +509,9 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Building the client loads SSL certificates, which took ~5s on your machine and froze
     # the audio loop. Doing it in a worker thread keeps the agent responsive.
-    http = await asyncio.to_thread(httpx.AsyncClient, base_url=API_URL, timeout=5)
+    http = await asyncio.to_thread(
+        lambda: httpx.AsyncClient(base_url=API_URL, timeout=5, headers=API_HEADERS)
+    )
     ctx.add_shutdown_callback(http.aclose)
 
     # Each stage has a primary + backup provider (see models.py).

@@ -1,6 +1,8 @@
 """Salon booking API: the single source of truth.
 Both the voice agent and (later) the website talk to this."""
+import logging
 import os
+import secrets
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -9,8 +11,9 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before importing notify, which reads settings at import time
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import db
@@ -27,6 +30,41 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 db.init()
+
+# ---------- security: API key ----------
+# Once the backend is on the internet, anyone who finds the URL could book, cancel, or read
+# customer details. So every endpoint requires the X-API-Key header, except a few that
+# expose no personal data (the Phase 2 website will read these from the browser).
+API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
+PUBLIC_PATHS = {"/health", "/health/db", "/services", "/calendar", "/docs", "/openapi.json"}
+log = logging.getLogger("uvicorn.error")
+if not API_KEY:
+    log.warning("BACKEND_API_KEY is not set: API is OPEN (fine locally, never in the cloud)")
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if (API_KEY and request.method != "OPTIONS"
+            and request.url.path not in PUBLIC_PATHS
+            and not secrets.compare_digest(request.headers.get("x-api-key", ""), API_KEY)):
+        return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/health")
+def health():
+    """Lightweight check for Render's health checks and keep-alive pings.
+    Deliberately does NOT touch the database: Neon's free plan sleeps after 5 idle minutes
+    and has a monthly compute allowance, so frequent pings must not wake it up."""
+    return {"ok": True, "database": db.ENGINE}
+
+
+@app.get("/health/db")
+def health_db():
+    """Deep check: confirms the database actually answers. Use it by hand, not for pings."""
+    with db.connect() as conn:
+        conn.execute("SELECT 1").fetchone()
+    return {"ok": True, "database": db.ENGINE, "db_reachable": True}
 
 
 # ---------- helpers ----------
@@ -196,12 +234,12 @@ def book(body: BookingIn, background: BackgroundTasks):
         with db.transaction(conn):
             if not is_free(conn, start, end):
                 raise HTTPException(409, "Sorry, that slot is already taken")
-            cur = conn.execute(
+            new_id = conn.execute(
                 """INSERT INTO appointments (service_id, customer_name, phone, start_time, end_time)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?) RETURNING id""",
                 (svc["id"], body.customer_name.strip(), phone, fmt(start), fmt(end)),
-            )
-        appt = get_appointment(conn, cur.lastrowid)
+            ).fetchone()["id"]  # RETURNING works on both SQLite and Postgres
+        appt = get_appointment(conn, new_id)
     background.add_task(notify.booking_confirmed, appt)
     return {**appt, "confirmation_sent": notify.enabled()}
 
@@ -215,9 +253,9 @@ def find_by_phone(phone: str):
         rows = conn.execute(
             """SELECT a.id, s.name AS service, a.customer_name, a.start_time, a.end_time
                FROM appointments a JOIN services s ON s.id = a.service_id
-               WHERE substr(a.phone, -10) = substr(?, -10) AND a.status = 'booked' AND a.start_time >= ?
+               WHERE a.phone LIKE ? AND a.status = 'booked' AND a.start_time >= ?
                ORDER BY a.start_time""",
-            (p, fmt(now_local())),
+            (f"%{p[-10:]}", fmt(now_local())),  # last 10 digits: with or without country code
         )
         return [dict(r) for r in rows]
 
@@ -270,20 +308,20 @@ def calendar(day: date):
 
 
 # ---------- escalation: callback requests ----------
-# NOTE: these endpoints expose customer phone numbers. They're fine on your own machine,
-# but need staff login before going public (Phase 5).
+# These endpoints expose customer phone numbers, so they require the API key (see above).
+# A proper staff login comes in Phase 5.
 
 @app.post("/callbacks", status_code=201)
 def request_callback(body: CallbackIn, background: BackgroundTasks):
     phone = normalize_phone(body.phone)
     with db.connect() as conn:
-        cur = conn.execute(
+        new_id = conn.execute(
             """INSERT INTO callback_requests (customer_name, phone, reason, urgency)
-               VALUES (?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?) RETURNING id""",
             (body.customer_name.strip(), phone, body.reason.strip(), body.urgency),
-        )
+        ).fetchone()["id"]
         cb = dict(conn.execute("SELECT * FROM callback_requests WHERE id = ?",
-                               (cur.lastrowid,)).fetchone())
+                               (new_id,)).fetchone())
     background.add_task(notify.staff_callback_alert, cb)
     return cb
 
