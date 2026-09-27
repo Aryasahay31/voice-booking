@@ -1,0 +1,19 @@
+# virtual environments
+.venv/
+
+# secrets: NEVER upload these
+.env
+
+# data that contains customer names and phone numbers
+*.db
+call_logs/
+pending_callbacks.jsonl
+
+# generated files
+__pycache__/
+.pytest_cache/
+*.log
+
+# editor / OS
+.vscode/
+Thumbs.db

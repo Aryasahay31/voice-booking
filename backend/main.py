@@ -1,0 +1,311 @@
+"""Salon booking API: the single source of truth.
+Both the voice agent and (later) the website talk to this."""
+import os
+from datetime import date, datetime, time, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv()  # must run before importing notify, which reads settings at import time
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import db
+import notify
+
+TZ = ZoneInfo(os.getenv("BUSINESS_TZ", "UTC"))
+OPEN_AT = time(10, 0)
+CLOSE_AT = time(19, 0)
+SLOT_STEP_MIN = 15  # 15-min steps so back-to-back services line up (e.g. 45-min manicure)
+CLOSED_WEEKDAYS = {6}  # 6 = Sunday
+
+app = FastAPI(title="Glow Studio Booking API")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+db.init()
+
+
+# ---------- helpers ----------
+
+def fmt(dt: datetime) -> str:
+    return dt.isoformat(timespec="minutes")
+
+
+def now_local() -> datetime:
+    return datetime.now(TZ).replace(tzinfo=None)
+
+
+def normalize_dt(dt: datetime) -> datetime:
+    if dt.tzinfo:
+        dt = dt.astimezone(TZ).replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
+
+
+def normalize_phone(phone: str) -> str:
+    digits = "".join(c for c in phone if c.isdigit())
+    if len(digits) < 6:
+        raise HTTPException(400, "That phone number looks too short")
+    return digits
+
+
+def get_service(conn, service_id: int):
+    row = conn.execute("SELECT * FROM services WHERE id = ?", (service_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Service not found")
+    return row
+
+
+def get_appointment(conn, appt_id: int) -> dict:
+    row = conn.execute(
+        """SELECT a.*, s.name AS service, s.price
+           FROM appointments a JOIN services s ON s.id = a.service_id
+           WHERE a.id = ?""",
+        (appt_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Appointment not found")
+    return dict(row)
+
+
+def is_free(conn, start: datetime, end: datetime, exclude_id: int | None = None) -> bool:
+    # Two intervals overlap when each starts before the other ends.
+    q = """SELECT 1 FROM appointments
+           WHERE status = 'booked' AND start_time < ? AND end_time > ?"""
+    params: list = [fmt(end), fmt(start)]
+    if exclude_id is not None:
+        q += " AND id != ?"
+        params.append(exclude_id)
+    return conn.execute(q, params).fetchone() is None
+
+
+def validate_slot(start: datetime, duration_min: int) -> datetime:
+    end = start + timedelta(minutes=duration_min)
+    if start.weekday() in CLOSED_WEEKDAYS:
+        raise HTTPException(400, "The salon is closed on Sundays")
+    if start.time() < OPEN_AT or end.time() > CLOSE_AT or end.date() != start.date():
+        raise HTTPException(
+            400, f"Outside opening hours ({OPEN_AT:%H:%M} to {CLOSE_AT:%H:%M})"
+        )
+    if start.minute % SLOT_STEP_MIN:
+        raise HTTPException(400, "Start times must be on a 15-minute mark (:00, :15, :30, :45)")
+    if start <= now_local():
+        raise HTTPException(400, "That time is in the past")
+    return end
+
+
+# ---------- schemas ----------
+
+class BookingIn(BaseModel):
+    service_id: int
+    customer_name: str = Field(min_length=1, max_length=80)
+    phone: str
+    start_time: datetime
+
+
+class RescheduleIn(BaseModel):
+    start_time: datetime
+
+
+class CallbackIn(BaseModel):
+    customer_name: str = Field(min_length=1, max_length=80)
+    phone: str
+    reason: str = Field(min_length=1, max_length=500)
+    urgency: Literal["normal", "urgent"] = "normal"
+
+
+# ---------- routes ----------
+
+@app.get("/services")
+def list_services():
+    with db.connect() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM services ORDER BY id")]
+
+
+@app.get("/availability")
+def availability(service_id: int, day: date):
+    with db.connect() as conn:
+        svc = get_service(conn, service_id)
+        if day.weekday() in CLOSED_WEEKDAYS:
+            return {"day": day.isoformat(), "service": svc["name"], "closed": True, "slots": []}
+
+        dur = timedelta(minutes=svc["duration_min"])
+        close = datetime.combine(day, CLOSE_AT)
+        now = now_local()
+        slots, t = [], datetime.combine(day, OPEN_AT)
+        while t + dur <= close:
+            if t > now and is_free(conn, t, t + dur):
+                slots.append(t.strftime("%H:%M"))
+            t += timedelta(minutes=SLOT_STEP_MIN)
+        return {"day": day.isoformat(), "service": svc["name"], "closed": False, "slots": slots}
+
+
+@app.get("/availability/back-to-back")
+def back_to_back(day: date, service_ids: list[int] = Query(...)):
+    """Start times where several services fit one after another (one chair, no overlaps).
+    Order matters: service_ids=5&service_ids=2 means manicure first, then hair colour.
+    Lives here (not in the agent or MCP server) so every client shares one implementation."""
+    with db.connect() as conn:
+        services = [get_service(conn, sid) for sid in service_ids]
+    names = [s["name"] for s in services]
+    if day.weekday() in CLOSED_WEEKDAYS:
+        return {"day": day.isoformat(), "services": names, "closed": True, "options": []}
+    free = [set(availability(s["id"], day)["slots"]) for s in services]
+
+    # Each service's free slots already account for existing bookings, so a chain where
+    # every service starts inside its own free slots never overlaps anything.
+    options = []
+    for first in sorted(free[0]):
+        t, plan = datetime.strptime(first, "%H:%M"), []
+        for svc, slots in zip(services, free):
+            hhmm = t.strftime("%H:%M")
+            if hhmm not in slots:
+                break
+            plan.append({"service": svc["name"], "start": hhmm})
+            t += timedelta(minutes=svc["duration_min"])
+        else:
+            options.append({"plan": plan, "all_done_by": t.strftime("%H:%M")})
+    return {"day": day.isoformat(), "services": names, "closed": False, "options": options}
+
+
+@app.get("/schedule")
+def schedule(day: date):
+    """Staff view: the full day with customer names and numbers.
+    NOTE: exposes personal data. Local use only until staff login exists (Phase 5)."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            """SELECT a.id, s.name AS service, a.customer_name, a.phone, a.start_time, a.end_time
+               FROM appointments a JOIN services s ON s.id = a.service_id
+               WHERE a.status = 'booked' AND a.start_time LIKE ?
+               ORDER BY a.start_time""",
+            (f"{day.isoformat()}%",),
+        )
+        return [dict(r) for r in rows]
+
+
+@app.post("/appointments", status_code=201)
+def book(body: BookingIn, background: BackgroundTasks):
+    start = normalize_dt(body.start_time)
+    phone = normalize_phone(body.phone)
+    with db.connect() as conn:
+        svc = get_service(conn, body.service_id)
+        end = validate_slot(start, svc["duration_min"])
+        with db.transaction(conn):
+            if not is_free(conn, start, end):
+                raise HTTPException(409, "Sorry, that slot is already taken")
+            cur = conn.execute(
+                """INSERT INTO appointments (service_id, customer_name, phone, start_time, end_time)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (svc["id"], body.customer_name.strip(), phone, fmt(start), fmt(end)),
+            )
+        appt = get_appointment(conn, cur.lastrowid)
+    background.add_task(notify.booking_confirmed, appt)
+    return {**appt, "confirmation_sent": notify.enabled()}
+
+
+@app.get("/appointments")
+def find_by_phone(phone: str):
+    """Upcoming bookings for a phone number (matched on the last 10 digits,
+    so it works with or without a country code)."""
+    p = normalize_phone(phone)
+    with db.connect() as conn:
+        rows = conn.execute(
+            """SELECT a.id, s.name AS service, a.customer_name, a.start_time, a.end_time
+               FROM appointments a JOIN services s ON s.id = a.service_id
+               WHERE substr(a.phone, -10) = substr(?, -10) AND a.status = 'booked' AND a.start_time >= ?
+               ORDER BY a.start_time""",
+            (p, fmt(now_local())),
+        )
+        return [dict(r) for r in rows]
+
+
+@app.patch("/appointments/{appt_id}")
+def reschedule(appt_id: int, body: RescheduleIn, background: BackgroundTasks):
+    start = normalize_dt(body.start_time)
+    with db.connect() as conn:
+        appt = get_appointment(conn, appt_id)
+        if appt["status"] != "booked":
+            raise HTTPException(400, "That appointment was cancelled")
+        svc = get_service(conn, appt["service_id"])
+        end = validate_slot(start, svc["duration_min"])
+        with db.transaction(conn):
+            if not is_free(conn, start, end, exclude_id=appt_id):
+                raise HTTPException(409, "Sorry, that slot is already taken")
+            conn.execute(
+                "UPDATE appointments SET start_time = ?, end_time = ? WHERE id = ?",
+                (fmt(start), fmt(end), appt_id),
+            )
+        appt = get_appointment(conn, appt_id)
+    background.add_task(notify.booking_rescheduled, appt)
+    return {**appt, "confirmation_sent": notify.enabled()}
+
+
+@app.post("/appointments/{appt_id}/cancel")
+def cancel(appt_id: int, background: BackgroundTasks):
+    with db.connect() as conn:
+        appt = get_appointment(conn, appt_id)
+        if appt["status"] == "cancelled":
+            raise HTTPException(400, "That appointment is already cancelled")
+        conn.execute("UPDATE appointments SET status = 'cancelled' WHERE id = ?", (appt_id,))
+        appt = get_appointment(conn, appt_id)
+    background.add_task(notify.booking_cancelled, appt)
+    return {**appt, "confirmation_sent": notify.enabled()}
+
+
+@app.get("/calendar")
+def calendar(day: date):
+    """Public view for the website's calendar: no names or phone numbers."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            """SELECT a.id, s.name AS service, a.start_time, a.end_time
+               FROM appointments a JOIN services s ON s.id = a.service_id
+               WHERE a.status = 'booked' AND a.start_time LIKE ?
+               ORDER BY a.start_time""",
+            (f"{day.isoformat()}%",),
+        )
+        return [dict(r) for r in rows]
+
+
+# ---------- escalation: callback requests ----------
+# NOTE: these endpoints expose customer phone numbers. They're fine on your own machine,
+# but need staff login before going public (Phase 5).
+
+@app.post("/callbacks", status_code=201)
+def request_callback(body: CallbackIn, background: BackgroundTasks):
+    phone = normalize_phone(body.phone)
+    with db.connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO callback_requests (customer_name, phone, reason, urgency)
+               VALUES (?, ?, ?, ?)""",
+            (body.customer_name.strip(), phone, body.reason.strip(), body.urgency),
+        )
+        cb = dict(conn.execute("SELECT * FROM callback_requests WHERE id = ?",
+                               (cur.lastrowid,)).fetchone())
+    background.add_task(notify.staff_callback_alert, cb)
+    return cb
+
+
+@app.get("/callbacks")
+def list_callbacks(status: Literal["open", "done", "all"] = "open"):
+    """Staff view: who needs a call back. Urgent first, then oldest first."""
+    q = "SELECT * FROM callback_requests"
+    params: list = []
+    if status != "all":
+        q += " WHERE status = ?"
+        params.append(status)
+    q += " ORDER BY urgency = 'urgent' DESC, created_at"
+    with db.connect() as conn:
+        return [dict(r) for r in conn.execute(q, params)]
+
+
+@app.post("/callbacks/{cb_id}/done")
+def complete_callback(cb_id: int):
+    with db.connect() as conn:
+        cur = conn.execute("UPDATE callback_requests SET status = 'done' WHERE id = ?", (cb_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Callback request not found")
+        return dict(conn.execute("SELECT * FROM callback_requests WHERE id = ?",
+                                 (cb_id,)).fetchone())

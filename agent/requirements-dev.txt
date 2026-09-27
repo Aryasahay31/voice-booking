@@ -1,0 +1,3 @@
+# Only needed to run the evals (python -m pytest)
+pytest>=8
+pytest-asyncio>=0.24
