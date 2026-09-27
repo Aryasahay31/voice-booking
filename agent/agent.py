@@ -93,6 +93,34 @@ def spoken_digits(text: str) -> str:
     return "".join(_NUMBER_WORDS.get(t, t if t.isdigit() else "") for t in tokens)
 
 
+_HOUR_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+               8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve"}
+
+
+def mentions_time(text: str, hhmm: str) -> bool:
+    """Does the text say this time? '16:00' matches '4:00 PM', '4 PM', 'four PM', '16:00'."""
+    h, m = (int(x) for x in hhmm.split(":"))
+    h12, word = h % 12 or 12, _HOUR_WORDS[h % 12 or 12]
+    ampm = r"\s*(?:am|pm|a\.m\.|p\.m\.|o'?clock)"
+    patterns = [rf"\b{h}:{m:02d}\b", rf"\b{h12}:{m:02d}\b"]
+    if m == 0:
+        patterns += [rf"\b{h12}{ampm}", rf"\b{word}{ampm}"]
+    elif m == 30:
+        patterns += [rf"half past (?:{word}|{h12})\b", rf"\b{word} thirty\b"]
+    elif m == 15:
+        patterns += [rf"quarter past (?:{word}|{h12})\b", rf"\b{word} fifteen\b"]
+    elif m == 45:
+        patterns += [rf"\b{word} forty[- ]five\b"]
+    t = text.lower()
+    return any(re.search(p, t) for p in patterns)
+
+
+def readback_covers(text: str, phone_digits: str, hhmm: str) -> bool:
+    """A read-back counts only if it includes every digit of the phone number (as digits or
+    words) AND the booking time. Those are what speech-to-text most often gets wrong."""
+    return phone_digits[-PHONE_DIGITS:] in spoken_digits(text) and mentions_time(text, hhmm)
+
+
 # ---- latency (Step 5) ----
 FILLER_AFTER_S = 1.5  # if a booking-system request takes longer than this, say a filler
 FILLERS = ["One moment, still checking.", "Bear with me a second.", "Just a sec, pulling that up."]
@@ -170,46 +198,38 @@ class BookingAssistant(VoiceAssistant):
         self._staged: dict[str, int] = {}  # action -> caller turn when it was read back
 
     def _confirm_gate(self, action_key: str, summary: str,
-                      must_mention: list[str] | None = None) -> str | None:
+                      readback_ok=None) -> str | None:
         """Two-step confirmation, enforced in code rather than trusted to the prompt.
 
         The action goes ahead (returns None) if EITHER:
           - it was staged by an earlier call and the caller has spoken since, OR
-          - Maya's message just before the caller's latest reply already read back the
-            key details (must_mention, e.g. name + phone digits), so the caller has
-            already confirmed them. This avoids asking twice.
+          - Maya's recent messages (before the caller's latest reply) already read back the
+            key details, checked by readback_ok(text). This avoids asking twice.
         Otherwise it's staged, and Maya gets instructions to read the details back."""
         staged_at = self._staged.get(action_key)
         if staged_at is not None and self.user_turns > staged_at:
             del self._staged[action_key]
             return None
-        if staged_at is None and must_mention and self._previous_reply_mentions(must_mention):
+        if staged_at is None and readback_ok and readback_ok(self._recent_replies_text()):
             return None
         self._staged[action_key] = self.user_turns
         return (f"NOT DONE YET. Read this back to the caller and ask them to confirm: {summary}. "
                 "Only if they clearly say yes, call this tool again with exactly the same details.")
 
-    def _previous_reply_mentions(self, required: list[str]) -> bool:
-        """Did Maya's last message before the caller's latest reply contain every required
-        item? Digit strings are matched against spoken digits ('six two zero' counts)."""
+    def _recent_replies_text(self, n: int = 2) -> str:
+        """Maya's last n messages before the caller's latest reply, joined together.
+        n=2 because a read-back can be split in two when the caller talks over it
+        (seen in a real call: "Thanks, Ritu! Just to" / "confirm, ... 6202764686")."""
         items = self.chat_ctx.items
         last_user = max((i for i, it in enumerate(items)
                          if it.type == "message" and it.role == "user"), default=None)
         if last_user is None:
-            return False
-        prev = next((it for it in reversed(items[:last_user])
-                     if it.type == "message" and it.role == "assistant"), None)
-        if prev is None or not prev.text_content:
-            return False
-        text = prev.text_content
-        said_digits = spoken_digits(text)
-        for req in required:
-            if req.isdigit():
-                if req not in said_digits:
-                    return False
-            elif req.lower() not in text.lower():
-                return False
-        return True
+            return ""
+        replies = [it.text_content or "" for it in items[:last_user]
+                   if it.type == "message" and it.role == "assistant"]
+        return " ".join(replies[-n:])
+
+    # ---------- booking-system helpers (not exposed to the LLM) ----------
 
     async def _filler_if_slow(self) -> None:
         """Say a short filler if the booking system is slow, so the caller doesn't hear dead air."""
@@ -289,8 +309,6 @@ class BookingAssistant(VoiceAssistant):
             )
         except Exception as e:  # no room in console mode, etc.
             logger.debug("calendar notify skipped: %s", e)
-
-    # ---------- tools ----------
 
     @function_tool
     async def request_human_callback(
@@ -431,7 +449,7 @@ class BookingAssistant(VoiceAssistant):
         if wait := self._confirm_gate(
             f"book|{svc['id']}|{day}|{time}|{customer_name.strip().lower()}|{digits_}",
             f"{svc['name']} on {day} at {time} for {customer_name}, phone {' '.join(digits_)}",
-            must_mention=[customer_name.strip(), digits_[-PHONE_DIGITS:]],
+            readback_ok=lambda text: readback_covers(text, digits_, time),
         ):
             return wait
         ok, data = await self._call(
