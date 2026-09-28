@@ -29,7 +29,8 @@ from livekit.agents import (
 )
 from livekit.agents import mcp
 from livekit.agents.beta.tools import EndCallTool
-from livekit.plugins import silero
+from livekit.agents import room_io
+from livekit.plugins import noise_cancellation, silero
 
 load_dotenv()  # before importing prompts, which reads .env settings at import time
 from datetime import datetime, timedelta, timezone
@@ -629,7 +630,19 @@ async def entrypoint(ctx: agents.JobContext):
             logger.error("UNRECOVERABLE error from %s: %s (all providers failed?)",
                          type(ev.source).__name__, ev.error)
 
-    await session.start(room=ctx.room, agent=agent)
+    await session.start(
+        room=ctx.room,
+        agent=agent,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                # Background voice cancellation (LiveKit Cloud): removes other people talking
+                # and background noise before speech-to-text and turn detection. Without it,
+                # a nearby conversation kept a caller's turn "open" for 53 seconds in testing.
+                # (Console mode uses your laptop mic directly, so this applies to room calls.)
+                noise_cancellation=noise_cancellation.BVC(),
+            ),
+        ),
+    )
     # Fixed greeting with the AI + recording disclosure. Not interruptible, so the caller
     # always hears the full disclosure before the conversation starts.
     await session.say(GREETING, allow_interruptions=False)

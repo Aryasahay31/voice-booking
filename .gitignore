@@ -3,6 +3,8 @@
 
 # secrets: NEVER upload these
 .env
+.env.*
+!.env.example
 
 # data that contains customer names and phone numbers
 *.db

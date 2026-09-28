@@ -1,0 +1,13 @@
+# Never send secrets or local data to the build service
+.env
+.env.*
+!.env.example
+call_logs/
+pending_callbacks.jsonl
+
+# Not needed in the container
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+*.pyc
