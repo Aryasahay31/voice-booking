@@ -1,8 +1,9 @@
 """Glow Studio voice receptionist, built on LiveKit Agents 1.x.
 Persona, greeting and instructions live in prompts.py.
 
-Run:  python agent.py console   (talk to it in your terminal)
-      python agent.py dev       (connect to your LiveKit project)
+Run locally:   python agent.py console   (talk to it in your terminal)
+Deploy:        lk agent deploy           (from this folder; see Dockerfile)
+Tests:         python -m pytest          (evals + gate unit tests)
 """
 import asyncio
 import json
@@ -33,8 +34,6 @@ from livekit.agents import room_io
 from livekit.plugins import noise_cancellation, silero
 
 load_dotenv()  # before importing prompts, which reads .env settings at import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from call_metrics import CallMetrics  # noqa: E402
 from models import build_llm, build_stt, build_tts, watch_availability  # noqa: E402
@@ -533,6 +532,18 @@ async def entrypoint(ctx: agents.JobContext):
     )
     ctx.add_shutdown_callback(http.aclose)
 
+    # Wake the backend as soon as the call starts. On Render's free tier it sleeps when idle
+    # and takes up to ~1 minute to wake; the greeting gives it a head start before the
+    # caller's first booking question. /health doesn't touch the database (saves Neon hours).
+    async def warm_up_backend() -> None:
+        try:
+            r = await http.get("/health", timeout=60)
+            logger.info("backend warm-up: %s", r.status_code)
+        except httpx.HTTPError as e:
+            logger.warning("backend warm-up failed: %r", e)
+
+    warm_up_task = asyncio.create_task(warm_up_backend())  # keep a reference so it isn't garbage-collected
+
     # Each stage has a primary + backup provider (see models.py).
     # VAD was loaded once in prewarm(); providers are built in a thread because creating
     # six HTTP clients (with SSL setup) froze the event loop for ~3s on startup.
@@ -549,9 +560,7 @@ async def entrypoint(ctx: agents.JobContext):
         vad=vad_model,
         turn_handling=TurnHandlingOptions(
             # The audio turn detector (semantic end-of-turn model) is the default, so we
-            # only tune timing. "dynamic" learns this caller's pause style: quick for
-            # snappy talkers, more patient for slow ones (e.g. reading out a phone number).
-# Tuned from call metrics:
+            # only tune timing. Values tuned from real call metrics:
             # - min 0.6: Deepgram's final transcript sometimes arrived after a 0.5s commit.
             # - max 1.5: short answers ("Yes.", "Okay.") often get a low end-of-turn score
             #   and were waiting the full maximum.
