@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/* Glow Studio design tokens. Used in classes like bg-mist, text-ink, bg-teal, font-display. */
+@theme {
+  --color-ink: #2e1a2b;        /* plum ink: text */
+  --color-muted: #6b5868;      /* secondary text (passes WCAG AA on mist and white) */
+  --color-mist: #f6f2f7;       /* lilac mist: page background */
+  --color-line: #dcd2df;       /* borders, timeline lines, dotted leaders */
+  --color-rose: #e3a9bc;       /* booked blocks on the chair timeline */
+  --color-teal: #1f6f6b;       /* the call action */
+  --color-teal-dark: #17534f;
+
+  --font-display: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-source), ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  background: var(--color-mist);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+/* Visible keyboard focus everywhere */
+:focus-visible {
+  outline: 3px solid var(--color-teal);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
