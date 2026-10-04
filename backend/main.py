@@ -3,6 +3,9 @@ Both the voice agent and (later) the website talk to this."""
 import logging
 import os
 import secrets
+import uuid
+from collections import defaultdict, deque
+from time import monotonic  # (plain "time" is already taken by datetime.time below)
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -18,6 +21,7 @@ from pydantic import BaseModel, Field
 
 import db
 import notify
+from livekit import api as livekit_api
 
 TZ = ZoneInfo(os.getenv("BUSINESS_TZ", "UTC"))
 OPEN_AT = time(10, 0)
@@ -36,7 +40,7 @@ db.init()
 # customer details. So every endpoint requires the X-API-Key header, except a few that
 # expose no personal data (the Phase 2 website will read these from the browser).
 API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
-PUBLIC_PATHS = {"/health", "/health/db", "/services", "/calendar", "/docs", "/openapi.json"}
+PUBLIC_PATHS = {"/health", "/health/db", "/services", "/calendar", "/token", "/docs", "/openapi.json"}
 log = logging.getLogger("uvicorn.error")
 if not API_KEY:
     log.warning("BACKEND_API_KEY is not set: API is OPEN (fine locally, never in the cloud)")
@@ -347,3 +351,68 @@ def complete_callback(cb_id: int):
             raise HTTPException(404, "Callback request not found")
         return dict(conn.execute("SELECT * FROM callback_requests WHERE id = ?",
                                  (cb_id,)).fetchone())
+
+
+# ---------- Phase 2: tokens for the website's "Talk to Shanaya" button ----------
+# The browser needs an access token to join a LiveKit room. Tokens are signed with the
+# LiveKit API secret, which must never reach a browser, so the backend signs a token for
+# ONE new room and hands only that token out. Maya joins new rooms automatically.
+#
+# This endpoint is public (the website calls it without our API key), so anyone could use
+# it to start calls that spend provider credits. Protections:
+#   - each token works for one fresh room only, and expires after a few minutes
+#   - a per-IP rate limit (in memory: resets on restart, per server instance; good enough
+#     for a demo, a production system would use something like Redis)
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
+TOKEN_TTL = timedelta(minutes=10)
+TOKEN_LIMIT = int(os.getenv("TOKEN_RATE_LIMIT", "5"))  # tokens per IP per window
+TOKEN_WINDOW_S = 10 * 60
+_token_requests: dict[str, deque] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    # Render sits behind a proxy, so the real visitor IP is in X-Forwarded-For.
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.post("/token")
+def create_token(request: Request):
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(503, "Voice calls aren't set up on this server yet")
+
+    ip, now = _client_ip(request), monotonic()
+    recent = _token_requests[ip]
+    while recent and now - recent[0] > TOKEN_WINDOW_S:
+        recent.popleft()
+    if len(recent) >= TOKEN_LIMIT:
+        raise HTTPException(429, "Too many call attempts. Please wait a few minutes and try again.")
+    recent.append(now)
+
+    room = f"web-{uuid.uuid4().hex[:12]}"
+    identity = f"visitor-{uuid.uuid4().hex[:8]}"
+    token = (
+        livekit_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name("Website visitor")
+        .with_ttl(TOKEN_TTL)
+        .with_grants(livekit_api.VideoGrants(
+            room_join=True,
+            room=room,              # this one room only
+            can_publish=True,       # send microphone audio
+            can_subscribe=True,     # hear Maya
+            can_publish_data=False, # the website only listens for calendar updates
+        ))
+        .to_jwt()
+    )
+    log.info("issued call token for room %s", room)
+    return {
+        "server_url": LIVEKIT_URL,
+        "participant_token": token,
+        "room_name": room,
+        "participant_identity": identity,
+    }
