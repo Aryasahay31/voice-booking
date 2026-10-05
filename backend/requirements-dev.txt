@@ -1,0 +1,2 @@
+# Only needed to run the backend tests (python -m pytest tests)
+pytest>=8

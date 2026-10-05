@@ -34,24 +34,54 @@ def _when(start_iso: str) -> str:
     return f"{dt:%A}, {dt.day} {dt:%B} at {dt.hour % 12 or 12}:{dt:%M} {dt:%p}"
 
 
+# Twilio error codes people commonly hit, explained in plain words.
+_TWILIO_HINTS = {
+    63015: "This number hasn't joined your WhatsApp sandbox. From that phone, send the "
+           "'join <your-code>' message to the sandbox number shown in the Twilio console.",
+    63016: "WhatsApp only allows free-form messages within 24 hours of the customer's last "
+           "message to you. In the sandbox, send the 'join' message again.",
+    21211: "The phone number isn't valid. Check DEFAULT_COUNTRY_CODE and the number itself.",
+    20003: "Twilio rejected the login. Check TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.",
+    21606: "TWILIO_FROM isn't a number your account can send from. For the sandbox, use the "
+           "sandbox number from the Twilio console, e.g. whatsapp:+14155238886.",
+}
+
+
+def send_now(phone_digits: str, body: str) -> str:
+    """Send one message immediately. Returns Twilio's message id, or raises with a
+    plain-language explanation. Used by send() and by send_test_message.py."""
+    if not enabled():
+        raise RuntimeError("NOTIFY_CHANNEL is 'none', so nothing is sent. Set it to 'whatsapp'.")
+    missing = [k for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM") if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(f"Missing settings: {', '.join(missing)}")
+
+    from twilio.base.exceptions import TwilioRestException
+    from twilio.rest import Client
+
+    to, from_ = to_e164(phone_digits), os.environ["TWILIO_FROM"].strip()
+    if CHANNEL == "whatsapp":
+        to = f"whatsapp:{to}"
+        if not from_.startswith("whatsapp:"):
+            from_ = f"whatsapp:{from_}"
+    try:
+        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+        return client.messages.create(to=to, from_=from_, body=body).sid
+    except TwilioRestException as e:
+        hint = _TWILIO_HINTS.get(e.code, "See the Twilio console's error logs for details.")
+        raise RuntimeError(f"Twilio error {e.code}: {hint}") from e
+
+
 def send(phone_digits: str, body: str) -> None:
     """Runs in a FastAPI background task, so a slow or failed send never blocks a booking."""
     if not enabled():
         logger.info("[confirmation not sent: NOTIFY_CHANNEL=none] to %s: %s", phone_digits, body)
         return
     try:
-        from twilio.rest import Client
-
-        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-        to, from_ = to_e164(phone_digits), os.environ["TWILIO_FROM"]
-        if CHANNEL == "whatsapp":
-            to = f"whatsapp:{to}"
-            if not from_.startswith("whatsapp:"):
-                from_ = f"whatsapp:{from_}"
-        msg = client.messages.create(to=to, from_=from_, body=body)
-        logger.info("confirmation sent via %s to %s (sid %s)", CHANNEL, to, msg.sid)
-    except Exception:
-        logger.exception("failed to send confirmation to %s", phone_digits)
+        sid = send_now(phone_digits, body)
+        logger.info("confirmation sent via %s to %s (sid %s)", CHANNEL, to_e164(phone_digits), sid)
+    except Exception as e:
+        logger.error("confirmation NOT sent to %s: %s", phone_digits, e)
 
 
 def booking_confirmed(appt: dict) -> None:
