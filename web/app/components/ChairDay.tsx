@@ -30,7 +30,9 @@ function headingDay(day: string): string {
 // The salon has one chair, so the day is one column: each appointment is a block sized
 // by how long it takes. Customer names never reach the website (/calendar omits them).
 export default function ChairDay() {
-  const days = useMemo(() => nextOpenDays(5), []);
+  // Two weeks of open days. Callers book further ahead than a single week (a Monday
+  // visitor booking for Saturday couldn't see it when this showed only 5 days).
+  const days = useMemo(() => nextOpenDays(12), []);
   const [day, setDay] = useState(days[0]);
   const [entries, setEntries] = useState<CalendarEntry[] | null>(null);
   const [failed, setFailed] = useState(false);
@@ -56,7 +58,13 @@ export default function ChairDay() {
     const timer = setInterval(refresh, REFRESH_MS);
     const onUpdate = (e: Event) => {
       const changedDay = (e as CustomEvent<{ day?: string }>).detail?.day;
-      if (!changedDay || changedDay === day) refresh();
+      if (!changedDay || changedDay === day) {
+        refresh();
+      } else if (days.includes(changedDay)) {
+        // Shanaya just booked a different day: show that day so the caller sees it appear.
+        setEntries(null);
+        setDay(changedDay);
+      }
     };
     window.addEventListener("focus", refresh);
     window.addEventListener(CALENDAR_UPDATED_EVENT, onUpdate);
@@ -66,12 +74,14 @@ export default function ChairDay() {
       window.removeEventListener("focus", refresh);
       window.removeEventListener(CALENDAR_UPDATED_EVENT, onUpdate);
     };
-  }, [day]);
+  }, [day, days]);
 
   const booked = entries?.length ?? 0;
 
   return (
-    <section aria-labelledby="chair-heading">
+    // min-w-0: grid columns otherwise grow to fit content, and the scrolling day row would
+    // stretch the whole page sideways on phones instead of scrolling within itself.
+    <section aria-labelledby="chair-heading" className="min-w-0">
       <h2 id="chair-heading" className="font-display text-2xl font-semibold">
         The chair, {headingDay(day)}
       </h2>
@@ -79,7 +89,11 @@ export default function ChairDay() {
         One chair, one appointment at a time. Shaded blocks are taken.
       </p>
 
-      <div role="group" aria-label="Choose a day" className="mt-4 flex flex-wrap gap-2">
+      <div
+        role="group"
+        aria-label="Choose a day"
+        className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2 [scrollbar-width:thin]"
+      >
         {days.map((d) => (
           <button
             key={d}
@@ -91,7 +105,7 @@ export default function ChairDay() {
               }
             }}
             aria-pressed={d === day}
-            className={`rounded-full border px-3 py-1.5 text-sm transition-colors ${
+            className={`shrink-0 rounded-full border px-3 py-1.5 text-sm transition-colors ${
               d === day
                 ? "border-ink bg-ink text-mist"
                 : "border-line bg-white hover:border-ink"
