@@ -30,8 +30,20 @@ SLOT_STEP_MIN = 15  # 15-min steps so back-to-back services line up (e.g. 45-min
 CLOSED_WEEKDAYS = {6}  # 6 = Sunday
 
 app = FastAPI(title="Glow Studio Booking API")
+# CORS: which WEBSITES may call this API from a visitor's browser. Without a limit, any site
+# could embed a "Talk to Shanaya" button that spends our provider credits. Set ALLOWED_ORIGINS
+# on Render to the real website, e.g. "https://voice-booking-ruby.vercel.app".
+# (CORS only restrains browsers; scripts can still call /token, which is why it's rate-limited.)
+ALLOWED_ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 db.init()
 
