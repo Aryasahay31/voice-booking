@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -31,6 +31,7 @@ from livekit.agents import (
 from livekit.agents import mcp
 from livekit.agents.beta.tools import EndCallTool
 from livekit.agents import room_io
+from livekit.agents.voice.room_io.types import NoiseCancellationParams
 from livekit.plugins import noise_cancellation, silero
 
 load_dotenv()  # before importing prompts, which reads .env settings at import time
@@ -39,6 +40,7 @@ from call_metrics import CallMetrics  # noqa: E402
 from models import build_llm, build_stt, build_tts, watch_availability  # noqa: E402
 from prompts import (  # noqa: E402
     AWAY_CHECKIN_INSTRUCTIONS,
+    CALLER_ID_INSTRUCTIONS,
     AWAY_GOODBYE,
     END_CALL_DESCRIPTION,
     END_CALL_GOODBYE,
@@ -122,6 +124,33 @@ def readback_covers(text: str, phone_digits: str, hhmm: str) -> bool:
     return phone_digits[-PHONE_DIGITS:] in spoken_digits(text) and mentions_time(text, hhmm)
 
 
+def readback_covers_caller_id(text: str, phone_digits: str, hhmm: str) -> bool:
+    """For the number the caller is phoning FROM (caller ID), nothing can be misheard, so
+    a read-back of the last 4 digits ("the number ending in 4686") plus the time is enough."""
+    return phone_digits[-4:] in spoken_digits(text) and mentions_time(text, hhmm)
+
+
+def pick_noise_cancellation(params: NoiseCancellationParams):
+    """Phone callers get the telephony model (tuned for narrow-band phone audio); website
+    visitors get the standard one."""
+    if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+        return noise_cancellation.BVCTelephony()
+    return noise_cancellation.BVC()
+
+
+def caller_number(room: rtc.Room) -> str | None:
+    """Digits of the phone caller's number from caller ID, or None for website/console calls
+    or numbers that don't look valid here."""
+    try:
+        for p in room.remote_participants.values():
+            if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                digits = "".join(c for c in p.attributes.get("sip.phoneNumber", "") if c.isdigit())
+                return digits if digits and phone_problem(digits) is None else None
+    except Exception as e:  # console mode has no real room
+        logger.debug("caller ID lookup skipped: %s", e)
+    return None
+
+
 # ---- latency (Step 5) ----
 FILLER_AFTER_S = 1.5  # if a booking-system request takes longer than this, say a filler
 FILLERS = ["One moment, still checking.", "Bear with me a second.", "Just a sec, pulling that up."]
@@ -148,6 +177,7 @@ class VoiceAssistant(Agent):
         )
         self.hold_until = 0.0  # monotonic time until which silence is expected (caller asked to wait)
         self.recording_consent: bool | None = None  # None = not discussed; False = don't save transcript
+        self.caller_phone: str | None = None  # digits from caller ID on phone calls (Phase 4)
 
     @property
     def user_turns(self) -> int:
@@ -450,7 +480,11 @@ class BookingAssistant(VoiceAssistant):
         if wait := self._confirm_gate(
             f"book|{svc['id']}|{day}|{time}|{customer_name.strip().lower()}|{digits_}",
             f"{svc['name']} on {day} at {time} for {customer_name}, phone {' '.join(digits_)}",
-            readback_ok=lambda text: readback_covers(text, digits_, time),
+            readback_ok=(
+                (lambda text: readback_covers_caller_id(text, digits_, time))
+                if self.caller_phone and digits_[-10:] == self.caller_phone[-10:]
+                else (lambda text: readback_covers(text, digits_, time))
+            ),
         ):
             return wait
         ok, data = await self._call(
@@ -649,12 +683,20 @@ async def entrypoint(ctx: agents.JobContext):
                 # and background noise before speech-to-text and turn detection. Without it,
                 # a nearby conversation kept a caller's turn "open" for 53 seconds in testing.
                 # (Console mode uses your laptop mic directly, so this applies to room calls.)
-                noise_cancellation=noise_cancellation.BVC(),
+                # BVCTelephony for phone callers, BVC for website visitors (Phase 4).
+                noise_cancellation=pick_noise_cancellation,
             ),
         ),
     )
     # Fixed greeting with the AI + recording disclosure. Not interruptible, so the caller
     # always hears the full disclosure before the conversation starts.
+    # Phone call? Offer the caller's own number instead of asking them to spell it out.
+    if digits := caller_number(ctx.room):
+        agent.caller_phone = digits
+        await agent.update_instructions(
+            agent.instructions + CALLER_ID_INSTRUCTIONS.format(last4=digits[-4:], number=digits)
+        )
+        logger.info("phone call from caller ID ending in %s", digits[-4:])
     await session.say(GREETING, allow_interruptions=False)
 
 
