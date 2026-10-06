@@ -378,6 +378,9 @@ def complete_callback(cb_id: int):
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
+# Phase 4: the agent only joins rooms that ask for it by name (explicit dispatch), which phone
+# calls need. Must match AGENT_DISPATCH_NAME in the agent's settings.
+AGENT_DISPATCH_NAME = os.getenv("AGENT_DISPATCH_NAME", "glow-studio").strip()
 TOKEN_TTL = timedelta(minutes=10)
 TOKEN_LIMIT = int(os.getenv("TOKEN_RATE_LIMIT", "5"))  # tokens per IP per window
 TOKEN_WINDOW_S = 10 * 60
@@ -418,6 +421,10 @@ def create_token(request: Request):
             can_publish=True,       # send microphone audio
             can_subscribe=True,     # hear Maya
             can_publish_data=False, # the website only listens for calendar updates
+        ))
+        # Ask for Shanaya by name: LiveKit dispatches her when this visitor creates the room.
+        .with_room_config(livekit_api.RoomConfiguration(
+            agents=[livekit_api.RoomAgentDispatch(agent_name=AGENT_DISPATCH_NAME)],
         ))
         .to_jwt()
     )
