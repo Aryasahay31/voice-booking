@@ -17,7 +17,13 @@ if len(sys.argv) != 2:
 phone = "".join(c for c in sys.argv[1] if c.isdigit())
 print(f"Channel: {notify.CHANNEL} | sending to {notify.to_e164(phone)} ...")
 try:
-    sid = notify.send_now(phone, f"Hi from {notify.BUSINESS_NAME}! Your booking confirmations are set up.")
+    if notify.CONTENT_SID:
+        print(f"Template mode: {notify.CONTENT_SID} with sample date and time")
+    sid = notify.send_now(
+        phone,
+        f"Hi from {notify.BUSINESS_NAME}! Your booking confirmations are set up.",
+        variables={"1": "Saturday, 10 October", "2": "3:00 PM"},
+    )
     print(f"Sent. Twilio message id: {sid}. Check WhatsApp on that phone.")
 except Exception as e:
     sys.exit(f"Not sent. {e}")

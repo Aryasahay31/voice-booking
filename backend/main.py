@@ -306,7 +306,7 @@ def cancel(appt_id: int, background: BackgroundTasks):
         conn.execute("UPDATE appointments SET status = 'cancelled' WHERE id = ?", (appt_id,))
         appt = get_appointment(conn, appt_id)
     background.add_task(notify.booking_cancelled, appt)
-    return {**appt, "confirmation_sent": notify.enabled()}
+    return {**appt, "confirmation_sent": notify.cancellation_messages_enabled()}
 
 
 @app.get("/calendar")

@@ -1,6 +1,7 @@
 """Tests for booking confirmations (Phase 3). Twilio is faked: no real messages are sent.
 Run from the backend folder:  python -m pytest tests -q
 """
+import json
 import os
 import sys
 from datetime import date, timedelta
@@ -111,3 +112,43 @@ def test_failed_send_never_breaks_the_booking(monkeypatch):
         FakeClient.return_value.messages.create.side_effect = RuntimeError("Twilio is down")
         r = book(TestClient(main.app))
     assert r.status_code == 201  # the booking is saved even though the message failed
+
+
+# ---------- template mode (new Twilio accounts require WhatsApp templates) ----------
+
+def test_template_mode_sends_content_sid_with_date_and_time(monkeypatch):
+    monkeypatch.setattr(notify, "CHANNEL", "whatsapp")
+    monkeypatch.setattr(notify, "CONTENT_SID", "HXtemplate123")
+    with patch.dict(os.environ, TWILIO_ENV), patch("twilio.rest.Client") as FakeClient:
+        FakeClient.return_value.messages.create.return_value = MagicMock(sid="SM9")
+        r = book(TestClient(main.app))
+    assert r.json()["confirmation_sent"] is True
+    kwargs = FakeClient.return_value.messages.create.call_args.kwargs
+    assert kwargs["content_sid"] == "HXtemplate123"
+    assert "body" not in kwargs  # templates replace free-form text
+    variables = json.loads(kwargs["content_variables"])
+    assert variables["2"] == "3:00 PM"
+    assert "," in variables["1"]  # e.g. "Tuesday, 6 October"
+
+
+def test_template_mode_skips_cancellations_and_says_so(monkeypatch):
+    monkeypatch.setattr(notify, "CHANNEL", "whatsapp")
+    monkeypatch.setattr(notify, "CONTENT_SID", "HXtemplate123")
+    with patch.dict(os.environ, TWILIO_ENV), patch("twilio.rest.Client") as FakeClient:
+        FakeClient.return_value.messages.create.return_value = MagicMock(sid="SM9")
+        c = TestClient(main.app)
+        appt_id = book(c).json()["id"]
+        cancel = c.post(f"/appointments/{appt_id}/cancel").json()
+    # only the booking was sent; the cancellation wasn't (and the API doesn't claim it was)
+    assert FakeClient.return_value.messages.create.call_count == 1
+    assert cancel["confirmation_sent"] is False
+
+
+def test_contentsid_error_explains_the_fix(monkeypatch):
+    monkeypatch.setattr(notify, "CHANNEL", "whatsapp")
+    monkeypatch.setattr(notify, "CONTENT_SID", "")
+    err = TwilioRestException(status=400, uri="/Messages", msg="ContentSid required", code=21654)
+    with patch.dict(os.environ, TWILIO_ENV), patch("twilio.rest.Client") as FakeClient:
+        FakeClient.return_value.messages.create.side_effect = err
+        with pytest.raises(RuntimeError, match="TWILIO_CONTENT_SID"):
+            notify.send_now("9876543210", "hi")
