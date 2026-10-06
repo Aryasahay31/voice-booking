@@ -49,6 +49,7 @@ from prompts import (  # noqa: E402
 logger = logging.getLogger("booking-agent")
 
 API_URL = os.getenv("BOOKING_API_URL", "http://127.0.0.1:8000")
+AGENT_DISPATCH_NAME = os.getenv("AGENT_DISPATCH_NAME", "glow-studio")
 # Must match the backend's BACKEND_API_KEY once it's deployed (empty = local, no key).
 _api_key = os.getenv("BACKEND_API_KEY", "").strip()
 API_HEADERS = {"X-API-Key": _api_key} if _api_key else {}
@@ -664,4 +665,10 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    agents.cli.run_app(agents.WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
+        # Explicit dispatch (Phase 4): join only rooms that ask for this name: website calls
+        # (the backend's /token asks for it) and phone calls (via a dispatch rule).
+        agent_name=AGENT_DISPATCH_NAME,
+    ))
